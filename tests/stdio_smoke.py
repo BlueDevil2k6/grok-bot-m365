@@ -6,7 +6,8 @@ from mcp.client.stdio import stdio_client, StdioServerParameters
 async def main():
     p = StdioServerParameters(command="uv", args=["run", "--directory", os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python", "server.py"],
                               env={**os.environ, "M365_CLIENT_ID": "00000000-0000-0000-0000-000000000000",
-                                   "M365_TOKEN_CACHE": "/tmp/grok-bot-m365-smoke-cache.json"})
+                                   "M365_TOKEN_CACHE": "/tmp/grok-bot-m365-smoke-cache.bin",
+                                   "M365_ALLOW_PLAINTEXT_CACHE": "1"})
     async with stdio_client(p) as (r, w):
         async with ClientSession(r, w) as s:
             await s.initialize()

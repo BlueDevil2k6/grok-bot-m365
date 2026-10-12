@@ -6,4 +6,4 @@ __pycache__/
 .env.*
 token_cache.json
 .token_cache.json
-*token_cache*.json
+*token_cache*

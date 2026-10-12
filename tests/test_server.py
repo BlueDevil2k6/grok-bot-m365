@@ -10,6 +10,12 @@ from server import GRAPH, MailError
 @pytest.fixture(autouse=True)
 def fake_token(monkeypatch):
     monkeypatch.setattr(server.auth, "token", lambda: "TEST")
+    monkeypatch.setenv("M365_SHARED_MAILBOXES", "ops@contoso.com")
+
+
+def mock_me():
+    return respx.get(f"{GRAPH}/me").respond(json={"mail": "user@contoso.com", "userPrincipalName": "user@contoso.com",
+        "proxyAddresses": ["SMTP:user@contoso.com", "smtp:t@contoso.com", "X500:/o=x", "smtp:sales@contoso.com"]})
 
 
 def body(route, i=-1):
@@ -18,8 +24,7 @@ def body(route, i=-1):
 
 @respx.mock
 def test_list_aliases():
-    respx.get(f"{GRAPH}/me").respond(json={"mail": "user@contoso.com", "userPrincipalName": "user@contoso.com",
-        "proxyAddresses": ["SMTP:user@contoso.com", "smtp:t@contoso.com", "X500:/o=x", "smtp:sales@contoso.com"]})
+    mock_me()
     r = server.list_aliases()
     assert r["primary"] == "user@contoso.com"
     assert r["smtp_addresses"] == ["user@contoso.com", "t@contoso.com", "sales@contoso.com"]
@@ -62,6 +67,7 @@ def test_get_message_text():
 
 @respx.mock
 def test_create_draft_alias():
+    mock_me()
     route = respx.post(f"{GRAPH}/me/messages").mock(side_effect=lambda req: httpx.Response(
         201, json={"id": "d1", "isDraft": True, **json.loads(req.content)}))
     r = server.create_draft(to="a@x.com; b@x.com", subject="Hi", body="Yo", from_address="sales@contoso.com")
@@ -82,6 +88,7 @@ def test_create_draft_shared_mailbox_defaults_from():
 
 @respx.mock
 def test_reply_draft_all():
+    mock_me()
     respx.post(f"{GRAPH}/me/messages/m1/createReplyAll").respond(
         json={"id": "r1", "body": {"contentType": "html", "content": "<div>old</div>"}})
     patch = respx.patch(f"{GRAPH}/me/messages/r1").mock(side_effect=lambda req: httpx.Response(
@@ -93,14 +100,79 @@ def test_reply_draft_all():
     assert r["draft_id"] == "r1"
 
 
+def draft(i, subject="Hi", to=("a@x.com",), bcc=()):
+    return {"id": i, "subject": subject, "isDraft": True, "body": {"contentType": "Text", "content": "b"},
+            "toRecipients": [{"emailAddress": {"address": a}} for a in to],
+            "bccRecipients": [{"emailAddress": {"address": a}} for a in bcc]}
+
+
 @respx.mock
 def test_send_draft_ok_and_alias_rejected():
-    respx.post(f"{GRAPH}/me/messages/d1/send").respond(202)
-    assert server.send_draft("d1") == {"sent": True, "draft_id": "d1"}
+    respx.get(f"{GRAPH}/me/messages/d1").respond(json=draft("d1", to=("A@x.com", "b@x.com")))
+    send = respx.post(f"{GRAPH}/me/messages/d1/send").respond(202)
+    r = server.send_draft("d1", recipients="b@x.com; a@X.com", subject=" Hi ")
+    assert r["sent"] is True and r["draft_id"] == "d1" and r["to"] == ["A@x.com", "b@x.com"] and send.called
+    respx.get(f"{GRAPH}/me/messages/d2").respond(json=draft("d2"))
     respx.post(f"{GRAPH}/me/messages/d2/send").respond(403, json={"error": {
         "code": "ErrorSendAsDenied", "message": "The user account which was used to submit this request does not have the right to send mail on behalf of the specified sending account."}})
     with pytest.raises(MailError, match="SendFromAliasEnabled"):
-        server.send_draft("d2")
+        server.send_draft("d2", recipients=["a@x.com"], subject="Hi")
+
+
+@respx.mock
+@pytest.mark.parametrize("recipients,subject,d", [
+    ("a@x.com", "Hi", draft("d", bcc=("evil@attacker.com",))),  # hidden extra recipient
+    ("a@x.com", "Hi", draft("d", to=("evil@attacker.com",))),    # swapped recipient
+    ("a@x.com", "Hi", draft("d", subject="Other")),              # different draft
+    ("a@x.com", "Hi", {**draft("d"), "isDraft": False}),         # not a draft
+])
+def test_send_draft_refuses_mismatch(recipients, subject, d):
+    respx.get(f"{GRAPH}/me/messages/d").respond(json=d)
+    send = respx.post(f"{GRAPH}/me/messages/d/send").respond(202)
+    with pytest.raises(MailError, match="nothing was sent"):
+        server.send_draft("d", recipients=recipients, subject=subject)
+    assert not send.called
+
+
+@respx.mock
+@pytest.mark.parametrize("call", [
+    lambda: server.get_message("x/../../../users/ceo@contoso.com/messages/abc"),
+    lambda: server.mark_read("../../users/ceo@contoso.com"),
+    lambda: server.list_messages(folder="../../users/ceo@contoso.com/mailFolders/inbox"),
+])
+def test_ids_cannot_traverse_paths(call):
+    route = respx.route().respond(404, json={"error": {"code": "ErrorItemNotFound", "message": "nf"}})
+    with pytest.raises(MailError):
+        call()
+    url = str(route.calls[0].request.url)
+    assert url.startswith(f"{GRAPH}/me/") and "/users/" not in url and "%2F" in url
+
+
+@pytest.mark.parametrize("bad", ["..", "."])
+def test_dot_ids_rejected(bad):
+    with pytest.raises(MailError, match="Invalid id"):
+        server.get_message(bad)
+
+
+def test_mailbox_not_in_allowlist_refused():
+    with pytest.raises(MailError, match="not in M365_SHARED_MAILBOXES"):
+        server.list_messages(mailbox="ceo@contoso.com")
+    with pytest.raises(MailError, match="not in M365_SHARED_MAILBOXES"):
+        server.send_draft("d", recipients="a@x.com", subject="s", mailbox="ceo@contoso.com")
+
+
+def test_graph_refuses_non_graph_url():
+    with pytest.raises(MailError, match="non-Graph URL"):
+        server.graph("GET", "https://evil.example/steal")
+
+
+def test_plaintext_cache_requires_opt_in(monkeypatch):
+    def no_keyring(_):
+        raise RuntimeError("no keyring")
+    monkeypatch.setattr(server, "build_encrypted_persistence", no_keyring)
+    monkeypatch.delenv("M365_ALLOW_PLAINTEXT_CACHE", raising=False)
+    with pytest.raises(MailError, match="M365_ALLOW_PLAINTEXT_CACHE"):
+        server._build_cache()
 
 
 @respx.mock
@@ -136,10 +208,14 @@ def test_no_send_mail_tool():
 
 
 @respx.mock
-def test_alias_hint_env(monkeypatch):
-    monkeypatch.setenv("M365_ALIASES", "user@contoso.com,user@example.com")
-    respx.post(f"{GRAPH}/me/messages").mock(side_effect=lambda req: httpx.Response(
+def test_from_address_must_be_own_or_allowed():
+    mock_me()
+    route = respx.post(f"{GRAPH}/me/messages").mock(side_effect=lambda req: httpx.Response(
         201, json={"id": "d", **json.loads(req.content)}))
-    assert "warnings" not in server.create_draft(to="a@x.com", subject="s", body="b", from_address="User@Example.com")
-    r = server.create_draft(to="a@x.com", subject="s", body="b", from_address="bob@else.com")
-    assert "not in M365_ALIASES" in r["warnings"][0] and r["from"] == "bob@else.com"
+    assert server.create_draft(to="a@x.com", subject="s", body="b", from_address="Sales@Contoso.com")["draft_id"] == "d"
+    assert server.create_draft(to="a@x.com", subject="s", body="b", from_address="ops@contoso.com")["draft_id"] == "d"
+    with pytest.raises(MailError, match="neither one of your SMTP addresses"):
+        server.create_draft(to="a@x.com", subject="s", body="b", from_address="ceo@contoso.com")
+    with pytest.raises(MailError, match="neither one of your SMTP addresses"):
+        server.reply_draft("m1", "hi", from_address="ceo@contoso.com")
+    assert route.call_count == 2
